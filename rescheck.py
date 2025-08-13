@@ -4,7 +4,8 @@ HPC Cluster Resource Availability Checker
 
 Checks if requested cores and memory are available on the cluster by calling pbsnodes
 and parsing the output to find available resources on compute nodes. Automatically
-determines eligible queues based on resource requirements.
+determines eligible queues based on resource requirements and provides practical
+alternatives when resources are not immediately available.
 """
 
 import argparse
@@ -207,17 +208,46 @@ def find_available_nodes(nodes, required_cores, required_memory_mb):
 
 def get_best_alternatives(nodes, required_cores, required_memory_mb, max_options=5):
     """Get best alternative options when exact requirements can't be met"""
-    # Filter nodes that have at least some resources
-    viable_nodes = [node for node in nodes if node['cpu_available'] > 0 and node['mem_available_mb'] > 0]
     
-    # Sort by available cores (descending), then by available memory (descending)
-    viable_nodes.sort(key=lambda x: (x['cpu_available'], x['mem_available_mb']), reverse=True)
+    # Analyze what's limiting
+    nodes_with_enough_cores = [n for n in nodes if n['cpu_available'] >= required_cores]
+    nodes_with_enough_memory = [n for n in nodes if n['mem_available_mb'] >= required_memory_mb]
     
-    # Return 2-5 options if available, otherwise return what we have
-    if len(viable_nodes) <= 1:
-        return viable_nodes
-    else:
-        return viable_nodes[:min(max_options, len(viable_nodes))]
+    # Determine limiting factor
+    if nodes_with_enough_cores and not nodes_with_enough_memory:
+        print("Memory is the limiting factor.")
+    elif nodes_with_enough_memory and not nodes_with_enough_cores:
+        print("Cores are the limiting factor.")
+    elif not nodes_with_enough_cores and not nodes_with_enough_memory:
+        print("Both cores and memory are limiting factors.")
+    
+    # Filter to nodes with meaningful resources (at least 5GB memory and some cores)
+    min_useful_memory_mb = 5 * 1024  # 5GB minimum
+    viable_nodes = [node for node in nodes 
+                   if node['cpu_available'] > 0 and 
+                      node['mem_available_mb'] >= min_useful_memory_mb]
+    
+    # If no nodes with 5GB+, lower threshold to 2GB
+    if not viable_nodes:
+        min_useful_memory_mb = 2 * 1024  # 2GB minimum
+        viable_nodes = [node for node in nodes 
+                       if node['cpu_available'] > 0 and 
+                          node['mem_available_mb'] >= min_useful_memory_mb]
+    
+    # Sort by a smarter metric: prefer nodes where you could actually run something useful
+    # Priority: nodes with good balance of cores and memory
+    def node_score(node):
+        cores = node['cpu_available']
+        memory_gb = node['mem_available_mb'] / 1024
+        # Score based on how useful this node would be
+        # Prefer nodes where you could run a reasonable fraction of your original request
+        core_fraction = min(cores / required_cores, 1.0)
+        memory_fraction = min(memory_gb / (required_memory_mb / 1024), 1.0)
+        return min(core_fraction, memory_fraction) * 1000 + cores
+    
+    viable_nodes.sort(key=node_score, reverse=True)
+    
+    return viable_nodes[:min(max_options, len(viable_nodes))]
 
 
 # Parse command line arguments
@@ -292,6 +322,18 @@ else:
     print("No, largest available allocations:")
     alternatives = get_best_alternatives(nodes, args.cores, required_memory_mb)
     for node in alternatives:
-        print(f"• {node['name']}: {node['cpu_available']} cores available, "
-              f"{mb_to_gb(node['mem_available_mb'])} GB available")
+        available_cores = node['cpu_available']
+        available_gb = mb_to_gb(node['mem_available_mb'])
+        
+        # Calculate what would actually work on this node using the user's memory formula
+        max_cores_by_memory = max(0, int((available_gb - args.mem_overhead) / args.mem_per_core))
+        practical_cores = min(available_cores, max_cores_by_memory)
+        
+        if practical_cores > 0:
+            practical_memory = int(practical_cores * args.mem_per_core + args.mem_overhead)
+            print(f"• {node['name']}: {available_cores} cores, {available_gb} GB available "
+                  f"→ could run {practical_cores} cores, {practical_memory} GB")
+        else:
+            print(f"• {node['name']}: {available_cores} cores, {available_gb} GB available "
+                  f"→ insufficient memory for any cores with your formula")
     sys.exit(1)
