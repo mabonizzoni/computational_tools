@@ -120,20 +120,21 @@ for filename in files_to_process:
     # Create scatter plot with classic terminal colors
     plt.clear_data()  # Clear previous plot
     plt.canvas_color('black')
-    plt.axes_color('white')
-    plt.scatter(iterations, energies_relative_kcal, color='green')
+    plt.axes_color('black')
+    plt.ticks_color('white')
     plt.title(f"SCF Energy - {os.path.basename(filename)}")
     plt.xlabel("Iteration")
-    plt.ylabel("Relative Energy (kcal/mol)")
+    plt.ylabel("Energy (kcal/mol)")
+    plt.scatter(iterations, energies_relative_kcal, color='green')
     
-    # Plot range with padding
+    # Add y-axis padding (5% on each side)
     data_max = max(energies_relative_kcal)
     padding = data_max * 0.05
     plt.ylim(-padding, data_max + padding)
     plt.yticks(range(0, int(data_max) + 1, 1))
-    
-    # Smart automatic x-axis tick spacing
-    total_iters = len(energies)
+
+    # Smart x-axis tick spacing
+    total_iters = len(energies_relative_kcal)
     if total_iters <= 10:
         spacing = 1     # Show every iteration for small counts
     elif total_iters <= 50:
@@ -144,7 +145,13 @@ for filename in files_to_process:
         spacing = 50
         
     plt.xticks(range(0, total_iters+1, spacing))
+    
+    # Add x-axis padding (1 unit on each side)
+    plt.xlim(0, total_iters + 1)
+
+    # Draw the plot
     plt.show()
 
-    # Brief pause between plots (optional)
-    input("Press Enter for next file...")
+    # Brief pause between plots (optional) - but not after the last file
+    if filename != files_to_process[-1]:
+        input("Press Enter for next file...")
