@@ -117,31 +117,33 @@ for filename in files_to_process:
         print(f"Only one SCF point found in {os.path.basename(filename)} - no convergence to plot")
         continue
 
-    # Plot with vertical padding and integer y ticks
-    data_max = max(energies_relative_kcal)
-    padding = data_max * 0.05
-
-    # Create scatter plot
+    # Create scatter plot with classic terminal colors
     plt.clear_data()  # Clear previous plot
-    plt.scatter(iterations, energies_relative_kcal)
+    plt.canvas_color('black')
+    plt.axes_color('white')
+    plt.scatter(iterations, energies_relative_kcal, color='green')
     plt.title(f"SCF Energy - {os.path.basename(filename)}")
     plt.xlabel("Iteration")
-    plt.ylabel("Energy (kcal/mol)")
-
+    plt.ylabel("Relative Energy (kcal/mol)")
+    
+    # Plot range with padding
+    data_max = max(energies_relative_kcal)
+    padding = data_max * 0.05
+    plt.ylim(-padding, data_max + padding)
+    plt.yticks(range(0, int(data_max) + 1, 1))
+    
     # Smart automatic x-axis tick spacing
-    total_iters = len(energies_relative_kcal)
+    total_iters = len(energies)
     if total_iters <= 10:
-        spacing = 1
+        spacing = 1     # Show every iteration for small counts
     elif total_iters <= 50:
         spacing = 5
     elif total_iters <= 200:
         spacing = 10
     else:
         spacing = 50
-
+        
     plt.xticks(range(0, total_iters+1, spacing))
-    plt.ylim(-padding, data_max + padding)
-    plt.yticks(range(0, int(data_max) + 1, 1))
     plt.show()
 
     # Brief pause between plots (optional)
