@@ -133,7 +133,7 @@ for i, filename in enumerate(files_to_process):
     format_and_print_results(filename, convergence_steps)
     
     # Pause between files (except after the last one)
-    if len(files_to_process) > 1 and i < len(files_to_process) - 1:
+    if len(files_to_process) > 1 and i < len(files_to_process) - 1 and sys.stdout.isatty():
         next_file = files_to_process[i + 1]
         print(f"\nNext file: {os.path.basename(next_file)}")
         input("Press Enter to continue...")
