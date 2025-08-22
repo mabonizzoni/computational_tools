@@ -5,6 +5,7 @@ import os
 import subprocess
 import json
 import re
+import glob  # Add this import for pattern matching
 
 def find_running_job_logs():
     """Find .log files using PBS tracking files for precise filename detection"""
@@ -105,7 +106,11 @@ if len(sys.argv) == 1:
 
     if not files_to_process:
         print("No log files found in running job directories")
-        print("Usage: python3 convergence_analysis.py <logfile1> [logfile2] ...")
+        print("Usage: python3 convergence_analysis.py <logfile1> [logfile2] ... or <pattern>")
+        print("Examples:")
+        print("  python3 convergence_analysis.py file1.log file2.log")
+        print("  python3 convergence_analysis.py *.log")
+        print("  python3 convergence_analysis.py calculation_*.log")
         sys.exit(1)
 
     print(f"Found {len(files_to_process)} log files from running jobs:")
@@ -114,8 +119,37 @@ if len(sys.argv) == 1:
     print()
 
 else:
-    # Files specified on command line
-    files_to_process = sys.argv[1:]
+    # Files/patterns specified on command line - expand glob patterns
+    files_to_process = []
+    for arg in sys.argv[1:]:
+        # Check if argument contains glob pattern characters
+        is_pattern = any(char in arg for char in ['*', '?', '['])
+        
+        # Expand glob patterns (e.g., "*.log", "test_*.log")
+        matches = glob.glob(arg)
+        if matches:
+            files_to_process.extend(matches)
+        elif is_pattern:
+            # Pattern found no matches - inform user
+            print(f"Warning: Pattern '{arg}' matched no files")
+        else:
+            # No pattern characters, treat as literal filename
+            files_to_process.append(arg)
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    files_to_process = [f for f in files_to_process if not (f in seen or seen.add(f))]
+    
+    if not files_to_process:
+        print("Error: No files found matching the specified patterns")
+        sys.exit(1)
+    
+    # Show what files were found if using patterns
+    if any('*' in arg or '?' in arg or '[' in arg for arg in sys.argv[1:]):
+        print(f"Found {len(files_to_process)} files matching pattern(s):")
+        for f in files_to_process:
+            print(f"  {f}")
+        print()
 
 # Process each file
 for i, filename in enumerate(files_to_process):
