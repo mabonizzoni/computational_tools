@@ -252,7 +252,8 @@ def get_best_alternatives(nodes, required_cores, required_memory_mb, max_options
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Check HPC cluster resource availability')
-parser.add_argument('cores', type=int, help='Number of cores required')
+parser.add_argument('cores', type=int, nargs='?', 
+                    help='Number of cores required (if not provided, calculates maximum for large queue)')
 parser.add_argument('memory', type=float, nargs='?', help='Memory required in GB (optional)')
 parser.add_argument('--mem-per-core', type=float, default=1.5, 
                     help='Memory per core in GB (default: 1.5)')
@@ -260,6 +261,18 @@ parser.add_argument('--mem-overhead', type=float, default=4.0,
                     help='Memory overhead in GB (default: 4.0)')
 
 args = parser.parse_args()
+
+# Auto-calculate cores if not provided
+if args.cores is None:
+    # Auto-calculate maximum cores for large queue (128 cores, 120 GB)
+    largeq_max_cores = 128
+    largeq_max_memory_gb = 120
+    
+    max_cores_by_memory = (largeq_max_memory_gb - args.mem_overhead) / args.mem_per_core
+    args.cores = min(int(max_cores_by_memory), largeq_max_cores)
+    auto_calculated = True
+else:
+    auto_calculated = False
 
 # Calculate memory requirement
 if args.memory is not None:
@@ -277,6 +290,11 @@ if not eligible_queues:
     print(f"Error: Resource request ({args.cores} cores, {int(required_memory_gb)} GB) exceeds all queue limits")
     sys.exit(1)
 
+if auto_calculated:
+    print(f"Auto-calculated maximum: {args.cores} cores")
+    print(f"Formula: ({120} - {args.mem_overhead}) / {args.mem_per_core} = {args.cores} cores (capped at 128)")
+    print()
+
 print(f"Looking for {args.cores} cores and {int(required_memory_gb)} GB of memory")
 
 # Show queue recommendations
@@ -291,8 +309,12 @@ elif express_eligible:
 
 # Run pbsnodes
 try:
-    result = subprocess.run(['pbsnodes', '-a'], capture_output=True, text=True, check=True)
+    result = subprocess.run(['pbsnodes', '-a'], capture_output=True, text=True, check=True, timeout=30)
     pbsnodes_output = result.stdout
+except subprocess.TimeoutExpired:
+    print("Error: pbsnodes command timed out after 30 seconds", file=sys.stderr)
+    print("The PBS system may be under heavy load. Try again later.", file=sys.stderr)
+    sys.exit(1)
 except subprocess.CalledProcessError as e:
     print(f"Error running pbsnodes: {e}", file=sys.stderr)
     sys.exit(1)
