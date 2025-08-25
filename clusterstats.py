@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-PBS Pro Cluster Utilization Parser
+clusterstats.py - PBS Pro Cluster Utilization Parser
 
 Automatically calls pbsnodes and calculates cluster utilization statistics.
-Tracks compute and GPU resources separately.
+Tracks compute and GPU resources separately using queue-based detection.
 """
 
 import subprocess
@@ -26,7 +26,7 @@ MONITORED_QUEUES = {
 
 def parse_memory_value(mem_str):
     """Convert memory string to MB"""
-    if not mem_str:
+    if not mem_str or mem_str == '<various>':
         return 0
     
     mem_str = str(mem_str).strip().lower()
@@ -48,7 +48,9 @@ def parse_memory_value(mem_str):
 
 def safe_int_parse(value, default=0):
     """Safely parse integer values, handling <various> and other edge cases"""
-    if not value or value == '<various>':
+    if not value or value == '<various>' or value == 'various':
+        return default
+    if isinstance(value, str) and value.strip() == '':
         return default
     try:
         return int(value)
@@ -73,48 +75,46 @@ def count_unique_jobs(jobs_str):
     
     return unique_jobs
 
-def is_gpu_node(node_name):
-    """Check if node is a GPU node based on name pattern"""
-    return 'g' in node_name.lower()
-
 def should_include_node(node_name, state, qlist, vntype):
     """
     Determine if a node should be included in utilization calculations
     Returns: (should_include: bool, reason: str, node_type: str)
     """
-    # Check if it's a GPU node
-    if is_gpu_node(node_name):
-        node_type = "gpu"
-    else:
-        node_type = "compute"
-    
-    # Skip if state contains DOWN or is offline
+    # First check: Skip nodes that are offline or down
+    # Mixed states like 'job-busy,offline' should be treated as offline
+    # since they're not available for new job scheduling
     state_str = str(state).upper()
     if 'DOWN' in state_str or 'OFFLINE' in state_str:
-        return False, "down_offline", node_type
+        return False, "down_offline", "unknown"
     
-    # Only include compute_vnode and gpu_vnode types
+    # Second check: Only include actual compute/GPU nodes
+    # Skip login nodes, storage nodes, etc. that might appear in pbsnodes
     if vntype not in ['compute_vnode', 'gpu_vnode']:
-        return False, "not_compute_vnode", node_type
+        return False, "not_compute_vnode", "unknown"
     
-    # Check queue assignments for non-GPU nodes
-    if not is_gpu_node(node_name) and qlist:
+    # Third check: Queue-based categorization
+    # This is our main logic for determining node purpose
+    if qlist:
         node_queues = set(str(qlist).split(','))
         node_queues = {q.strip() for q in node_queues if q.strip()}
         
-        # Check for specific excluded queue types
-        if 'interactiveq' in node_queues:
-            return False, "interactive", node_type
-        elif 'classq' in node_queues:
-            return False, "class", node_type
-        elif 'sysadminq' in node_queues and not (MONITORED_QUEUES & node_queues):
-            return False, "admin", node_type
+        # GPU nodes: Any node serving the GPU queue
+        # These get separate resource tracking (CPU cores + GPU devices)
+        if 'gpuq' in node_queues:
+            return True, "included", "gpu"
         
-        # Include if node has at least one monitored queue
-        if not (MONITORED_QUEUES & node_queues):
-            return False, "other_excluded", node_type
+        # Compute nodes: Any node serving our monitored batch queues
+        # Include nodes even if they also serve other queues (e.g., "smallq,classq")
+        if MONITORED_QUEUES & node_queues:
+            return True, "included", "compute"
+        
+        # Exclude nodes that only serve non-monitored queues
+        # These are dedicated interactive, class, or admin nodes
+        return False, "no_monitored_queues", "compute"
     
-    return True, "included", node_type
+    # Fallback: If no queue list, assume it's a compute node
+    # This shouldn't happen in practice but provides safe default
+    return True, "included", "compute"
 
 def get_color_for_utilization(percentage):
     """Get color code based on utilization percentage"""
@@ -124,6 +124,21 @@ def get_color_for_utilization(percentage):
         return Colors.YELLOW
     else:
         return Colors.RED
+
+def calculate_utilization_display(assigned, available, resource_name):
+    """Calculate utilization percentage and return formatted display string with color"""
+    if available > 0:
+        util_percent = (assigned / available) * 100
+        color = get_color_for_utilization(util_percent)
+        if resource_name == "cores":
+            return f"{color}{assigned:,} used / {available:,} total {resource_name} ({util_percent:.1f}%){Colors.RESET}"
+        else:  # memory
+            return f"{color}{format_memory(assigned)} used / {format_memory(available)} total ({util_percent:.1f}%){Colors.RESET}"
+    else:
+        if resource_name == "cores":
+            return f"0 used / 0 total {resource_name} (0.0%)"
+        else:  # memory
+            return f"0 used / 0 total (0.0%)"
 
 def format_memory(mb):
     """Format memory in human-readable units"""
@@ -187,11 +202,12 @@ def parse_pbsnodes_output(content):
 def analyze_cluster():
     """Analyze cluster utilization and return statistics"""
     
-    # Get node data
+    # Step 1: Get raw node data from PBS
     pbsnodes_output = run_pbsnodes()
     nodes = parse_pbsnodes_output(pbsnodes_output)
     
-    # Initialize counters
+    # Step 2: Initialize statistics tracking
+    # Separate tracking for compute vs GPU resources
     stats = {
         'compute': {
             'included_nodes': 0,
@@ -205,59 +221,71 @@ def analyze_cluster():
         'gpu': {
             'included_nodes': 0,
             'offline_nodes': 0,
-            'cpu_cores_available': 0,
+            'cpu_cores_available': 0,    # CPU cores on GPU nodes
             'cpu_cores_assigned': 0,
-            'gpu_devices_available': 0,
+            'gpu_devices_available': 0,  # Actual GPU devices (ngpus)
             'gpu_devices_assigned': 0,
-            'memory_available_mb': 0,
+            'memory_available_mb': 0,    # System memory on GPU nodes
             'memory_assigned_mb': 0,
             'unique_jobs': set()
         },
         'total_nodes': 0,
-        'excluded_counts': defaultdict(int),
-        'excluded_nodes': defaultdict(list)
+        'excluded_counts': defaultdict(int),    # Count by exclusion reason
+        'excluded_nodes': defaultdict(list)     # Actual node names by reason
     }
     
-    # Process each node
+    # Step 3: Process each node and categorize it
     for node in nodes:
         stats['total_nodes'] += 1
         node_name = node['name']
         
-        # Extract node properties
+        # Extract key node properties for decision making
         state = node.get('state', 'unknown')
         qlist = node.get('resources_available.Qlist', '')
         vntype = node.get('resources_available.vntype', '')
         
-        # Determine if node should be included
+        # Step 4: Apply inclusion/exclusion logic
         include, reason, node_type = should_include_node(node_name, state, qlist, vntype)
         
-        # Handle offline nodes
+        # Step 5: Handle offline nodes
+        # We track offline counts separately since they affect capacity planning
         if reason == "down_offline":
-            if node_type == "gpu":
-                stats['gpu']['offline_nodes'] += 1
+            # Determine what type of node this would be if it were online
+            # This helps with capacity planning and understanding true cluster size
+            if qlist:
+                node_queues = set(str(qlist).split(','))
+                node_queues = {q.strip() for q in node_queues if q.strip()}
+                if 'gpuq' in node_queues:
+                    stats['gpu']['offline_nodes'] += 1
+                else:
+                    stats['compute']['offline_nodes'] += 1
             else:
+                # Default assumption if no queue info available
                 stats['compute']['offline_nodes'] += 1
             continue
         
-        # Handle excluded nodes
+        # Step 6: Handle excluded nodes
+        # Track these for reporting what's not being counted
         if not include:
             stats['excluded_counts'][reason] += 1
             stats['excluded_nodes'][reason].append(node_name)
             continue
         
-        # Extract resource information
+        # Step 7: Extract and aggregate resource information for included nodes
+        # Use safe parsing to handle PBS edge cases like '<various>' values
         ncpus_available = safe_int_parse(node.get('resources_available.ncpus', 0))
         ncpus_assigned = safe_int_parse(node.get('resources_assigned.ncpus', 0))
         
         mem_available = parse_memory_value(node.get('resources_available.mem', '0'))
         mem_assigned = parse_memory_value(node.get('resources_assigned.mem', '0'))
         
-        # Count unique jobs
+        # Extract job information for utilization tracking
         jobs_str = node.get('jobs', '')
         unique_jobs = count_unique_jobs(jobs_str)
         
-        # Add to appropriate category
+        # Step 8: Add resources to appropriate category
         if node_type == "gpu":
+            # GPU nodes: track both CPU cores AND GPU devices
             stats['gpu']['included_nodes'] += 1
             stats['gpu']['cpu_cores_available'] += ncpus_available
             stats['gpu']['cpu_cores_assigned'] += ncpus_assigned
@@ -265,13 +293,14 @@ def analyze_cluster():
             stats['gpu']['memory_assigned_mb'] += mem_assigned
             stats['gpu']['unique_jobs'].update(unique_jobs)
             
-            # Handle GPU devices
+            # GPU-specific resources: actual GPU devices
             ngpus_available = safe_int_parse(node.get('resources_available.ngpus', 0))
             ngpus_assigned = safe_int_parse(node.get('resources_assigned.ngpus', 0))
             stats['gpu']['gpu_devices_available'] += ngpus_available
             stats['gpu']['gpu_devices_assigned'] += ngpus_assigned
             
         else:  # compute node
+            # Regular compute nodes: just CPU cores and system memory
             stats['compute']['included_nodes'] += 1
             stats['compute']['cores_available'] += ncpus_available
             stats['compute']['cores_assigned'] += ncpus_assigned
@@ -284,55 +313,32 @@ def analyze_cluster():
 def print_utilization_report(stats):
     """Print formatted utilization report"""
     
-    print(f"{Colors.BOLD}PBS CLUSTER UTILIZATION{Colors.RESET}")
-    print("=" * 24)
+    print(f"{Colors.BOLD}CLUSTER UTILIZATION{Colors.RESET}")
+    print("=" * 19)
     
-    # Compute section
+    # Section 1: Compute node summary
+    # Show both active and offline counts for capacity planning
     compute_total_nodes = stats['compute']['included_nodes'] + stats['compute']['offline_nodes']
     print(f"Compute Nodes: {stats['compute']['included_nodes']} active, {stats['compute']['offline_nodes']} offline ({compute_total_nodes} total)")
     
-    if stats['compute']['cores_available'] > 0:
-        cpu_util = (stats['compute']['cores_assigned'] / stats['compute']['cores_available']) * 100
-        cpu_color = get_color_for_utilization(cpu_util)
-        print(f"CPU:          {cpu_color}{stats['compute']['cores_assigned']:,} used / {stats['compute']['cores_available']:,} total cores ({cpu_util:.1f}%){Colors.RESET}")
-    else:
-        print(f"CPU:          0 used / 0 total cores (0.0%)")
+    # Display compute resource utilization with color coding
+    print(f"CPU:          {calculate_utilization_display(stats['compute']['cores_assigned'], stats['compute']['cores_available'], 'cores')}")
+    print(f"Memory:       {calculate_utilization_display(stats['compute']['memory_assigned_mb'], stats['compute']['memory_available_mb'], 'memory')}")
     
-    if stats['compute']['memory_available_mb'] > 0:
-        mem_util = (stats['compute']['memory_assigned_mb'] / stats['compute']['memory_available_mb']) * 100
-        mem_color = get_color_for_utilization(mem_util)
-        print(f"Memory:       {mem_color}{format_memory(stats['compute']['memory_assigned_mb'])} used / {format_memory(stats['compute']['memory_available_mb'])} total ({mem_util:.1f}%){Colors.RESET}")
-    else:
-        print(f"Memory:       0 used / 0 total (0.0%)")
-    
-    # GPU section (only show if GPU nodes exist)
+    # Section 2: GPU node summary (only show if GPU nodes exist)
+    # This section appears only if cluster has GPU resources
     if stats['gpu']['included_nodes'] > 0 or stats['gpu']['offline_nodes'] > 0:
-        print()
+        print()  # Blank line separator
         gpu_total_nodes = stats['gpu']['included_nodes'] + stats['gpu']['offline_nodes']
         print(f"GPU Nodes:    {stats['gpu']['included_nodes']} active, {stats['gpu']['offline_nodes']} offline ({gpu_total_nodes} total)")
         
-        if stats['gpu']['cpu_cores_available'] > 0:
-            gpu_cpu_util = (stats['gpu']['cpu_cores_assigned'] / stats['gpu']['cpu_cores_available']) * 100
-            gpu_cpu_color = get_color_for_utilization(gpu_cpu_util)
-            print(f"CPU:          {gpu_cpu_color}{stats['gpu']['cpu_cores_assigned']:,} used / {stats['gpu']['cpu_cores_available']:,} total cores ({gpu_cpu_util:.1f}%){Colors.RESET}")
-        else:
-            print(f"CPU:          0 used / 0 total cores (0.0%)")
-        
-        if stats['gpu']['gpu_devices_available'] > 0:
-            gpu_util = (stats['gpu']['gpu_devices_assigned'] / stats['gpu']['gpu_devices_available']) * 100
-            gpu_color = get_color_for_utilization(gpu_util)
-            print(f"GPUs:         {gpu_color}{stats['gpu']['gpu_devices_assigned']:,} used / {stats['gpu']['gpu_devices_available']:,} total devices ({gpu_util:.1f}%){Colors.RESET}")
-        else:
-            print(f"GPUs:         0 used / 0 total devices (0.0%)")
-        
-        if stats['gpu']['memory_available_mb'] > 0:
-            gpu_mem_util = (stats['gpu']['memory_assigned_mb'] / stats['gpu']['memory_available_mb']) * 100
-            gpu_mem_color = get_color_for_utilization(gpu_mem_util)
-            print(f"GPU Memory:   {gpu_mem_color}{format_memory(stats['gpu']['memory_assigned_mb'])} used / {format_memory(stats['gpu']['memory_available_mb'])} total ({gpu_mem_util:.1f}%){Colors.RESET}")
-        else:
-            print(f"GPU Memory:   0 used / 0 total (0.0%)")
+        # GPU nodes have both CPU cores AND GPU devices to track
+        print(f"CPU:          {calculate_utilization_display(stats['gpu']['cpu_cores_assigned'], stats['gpu']['cpu_cores_available'], 'cores')}")
+        print(f"GPUs:         {calculate_utilization_display(stats['gpu']['gpu_devices_assigned'], stats['gpu']['gpu_devices_available'], 'devices')}")
+        print(f"GPU Memory:   {calculate_utilization_display(stats['gpu']['memory_assigned_mb'], stats['gpu']['memory_available_mb'], 'memory')}")
     
-    # Jobs section
+    # Section 3: Job summary
+    # Show running jobs by category (helps understand workload distribution)
     print()
     total_compute_jobs = len(stats['compute']['unique_jobs'])
     total_gpu_jobs = len(stats['gpu']['unique_jobs'])
@@ -342,33 +348,23 @@ def print_utilization_report(stats):
     else:
         print(f"Jobs:         {total_compute_jobs} running")
     
-    # Print exclusions with node names
+    # Section 4: Exclusions summary
+    # Report what nodes are not counted and why (for transparency)
     exclusions = []
     
-    # Interactive nodes
-    if stats['excluded_counts']['interactive'] > 0:
-        interactive_nodes = ', '.join(sorted(stats['excluded_nodes']['interactive']))
-        plural = "nodes" if stats['excluded_counts']['interactive'] > 1 else "node"
-        exclusions.append(f"  {stats['excluded_counts']['interactive']} interactive {plural} ({interactive_nodes})")
+    # Nodes that only serve non-monitored queues (interactive, class, admin only)
+    if stats['excluded_counts']['no_monitored_queues'] > 0:
+        excluded_nodes = ', '.join(sorted(stats['excluded_nodes']['no_monitored_queues']))
+        plural = "nodes" if stats['excluded_counts']['no_monitored_queues'] > 1 else "node"
+        exclusions.append(f"  {stats['excluded_counts']['no_monitored_queues']} {plural} with no monitored queues ({excluded_nodes})")
     
-    # Admin nodes  
-    if stats['excluded_counts']['admin'] > 0:
-        admin_nodes = ', '.join(sorted(stats['excluded_nodes']['admin']))
-        plural = "nodes" if stats['excluded_counts']['admin'] > 1 else "node"
-        exclusions.append(f"  {stats['excluded_counts']['admin']} admin {plural} ({admin_nodes})")
+    # Other exclusions (wrong vnode type, login nodes, etc.)
+    if stats['excluded_counts']['not_compute_vnode'] > 0:
+        other_nodes = ', '.join(sorted(stats['excluded_nodes']['not_compute_vnode']))
+        plural = "nodes" if stats['excluded_counts']['not_compute_vnode'] > 1 else "node"
+        exclusions.append(f"  {stats['excluded_counts']['not_compute_vnode']} non-compute {plural} ({other_nodes})")
     
-    # Class nodes
-    if stats['excluded_counts']['class'] > 0:
-        class_nodes = ', '.join(sorted(stats['excluded_nodes']['class']))
-        plural = "nodes" if stats['excluded_counts']['class'] > 1 else "node"
-        exclusions.append(f"  {stats['excluded_counts']['class']} class {plural} ({class_nodes})")
-    
-    # Other excluded nodes
-    if stats['excluded_counts']['other_excluded'] > 0:
-        other_nodes = ', '.join(sorted(stats['excluded_nodes']['other_excluded']))
-        plural = "nodes" if stats['excluded_counts']['other_excluded'] > 1 else "node"
-        exclusions.append(f"  {stats['excluded_counts']['other_excluded']} other excluded {plural} ({other_nodes})")
-    
+    # Only show exclusions section if there are actually excluded nodes
     if exclusions:
         print(f"\nExcluded:")
         for exclusion in exclusions:
