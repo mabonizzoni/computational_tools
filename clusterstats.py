@@ -4,8 +4,10 @@ clusterstats.py - PBS Pro Cluster Utilization Parser
 
 Automatically calls pbsnodes and calculates cluster utilization statistics.
 Tracks compute and GPU resources separately using queue-based detection.
+Uses pbsnodes -av for detailed vnode information and reliable queue data.
 """
 
+import json
 import subprocess
 import sys
 from collections import defaultdict
@@ -150,61 +152,67 @@ def format_memory(mb):
         return f"{mb:.0f} MB"
 
 def run_pbsnodes():
-    """Execute pbsnodes command and return text output"""
+    """Execute pbsnodes command and return JSON data"""
     try:
         result = subprocess.run(
-            ['pbsnodes', '-a'],
+            ['pbsnodes', '-av', '-F', 'json'],
             capture_output=True,
             text=True,
             check=True
         )
-        return result.stdout
+        return json.loads(result.stdout)
     except subprocess.CalledProcessError as e:
         print(f"Error running pbsnodes: {e}")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"Error parsing pbsnodes JSON output: {e}")
         sys.exit(1)
     except FileNotFoundError:
         print("Error: pbsnodes command not found. Make sure PBS Pro is installed and in PATH.")
         sys.exit(1)
 
-def parse_pbsnodes_output(content):
-    """Parse pbsnodes -a text output and return node information"""
-    lines = content.strip().split('\n')
-    nodes = []
-    current_node = None
+def parse_pbsnodes_output(json_data):
+    """Parse pbsnodes -av JSON output and return node information"""
+    # Extract nodes from JSON structure
+    nodes = json_data.get('nodes', {})
+    processed_nodes = []
     
-    for line in lines:
-        line = line.rstrip()
-        if not line:
+    for node_name, node_data in nodes.items():
+        # Skip empty vnodes (vnodes with no actual resources)
+        # These show up with 0 CPUs, 0 memory, 0 GPUs and don't contribute to utilization
+        resources_available = node_data.get('resources_available', {})
+        ncpus = safe_int_parse(resources_available.get('ncpus', 0))
+        mem_mb = parse_memory_value(resources_available.get('mem', '0'))
+        
+        # Skip vnodes that have no computational resources
+        if ncpus == 0 and mem_mb == 0:
             continue
-            
-        if not line.startswith(' ') and not line.startswith('\t'):
-            # New node name
-            if current_node:
-                nodes.append(current_node)
-            current_node = {'name': line.strip()}
-        else:
-            # Attribute line
-            if current_node is None:
-                continue
-            line = line.strip()
-            if '=' in line:
-                key, value = line.split('=', 1)
-                key = key.strip()
-                value = value.strip()
-                current_node[key] = value
+        
+        # Convert to our standard node format for processing
+        processed_node = {
+            'name': node_name,
+            'state': ','.join(node_data.get('state', [])) if isinstance(node_data.get('state'), list) else str(node_data.get('state', 'unknown')),
+            'resources_available.Qlist': resources_available.get('Qlist', ''),
+            'resources_available.vntype': resources_available.get('vntype', ''),
+            'resources_available.ncpus': str(ncpus),
+            'resources_assigned.ncpus': str(safe_int_parse(node_data.get('resources_assigned', {}).get('ncpus', 0))),
+            'resources_available.mem': resources_available.get('mem', '0'),
+            'resources_assigned.mem': node_data.get('resources_assigned', {}).get('mem', '0'),
+            'resources_available.ngpus': str(safe_int_parse(resources_available.get('ngpus', 0))),
+            'resources_assigned.ngpus': str(safe_int_parse(node_data.get('resources_assigned', {}).get('ngpus', 0))),
+            'jobs': ','.join(node_data.get('jobs', [])) if isinstance(node_data.get('jobs'), list) else str(node_data.get('jobs', ''))
+        }
+        
+        processed_nodes.append(processed_node)
     
-    # Don't forget the last node
-    if current_node:
-        nodes.append(current_node)
-    
-    return nodes
+    return processed_nodes
 
 def analyze_cluster():
     """Analyze cluster utilization and return statistics"""
     
-    # Step 1: Get raw node data from PBS
-    pbsnodes_output = run_pbsnodes()
-    nodes = parse_pbsnodes_output(pbsnodes_output)
+    # Step 1: Get raw node data from PBS using JSON format with vnodes
+    pbsnodes_data = run_pbsnodes()
+    nodes = parse_pbsnodes_output(pbsnodes_data)
     
     # Step 2: Initialize statistics tracking
     # Separate tracking for compute vs GPU resources
@@ -234,7 +242,8 @@ def analyze_cluster():
         'excluded_nodes': defaultdict(list)     # Actual node names by reason
     }
     
-    # Step 3: Process each node and categorize it
+    # Step 3: Process each vnode and categorize it
+    # Note: We're now processing vnodes, but aggregating them transparently
     for node in nodes:
         stats['total_nodes'] += 1
         node_name = node['name']
