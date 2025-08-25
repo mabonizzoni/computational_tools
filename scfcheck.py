@@ -131,7 +131,19 @@ for filename in files_to_process:
     data_max = max(energies_relative_kcal)
     padding = data_max * 0.05
     plt.ylim(-padding, data_max + padding)
-    plt.yticks(range(0, int(data_max) + 1, 1))
+    
+    # Adaptive y-axis tick spacing based on data range
+    if data_max < 1:
+        spacing = 0.1  # 0.0, 0.1, 0.2, 0.3...
+        vertical_ticks = [round(i * spacing, 1) for i in range(0, int(data_max/spacing) + 2)]
+    elif data_max < 5:
+        spacing = 0.5  # 0.0, 0.5, 1.0, 1.5...
+        vertical_ticks = [round(i * spacing, 1) for i in range(0, int(data_max/spacing) + 2)]
+    else:
+        spacing = 1    # 0, 1, 2, 3... (current behavior)
+        vertical_ticks = list(range(0, int(data_max) + 1, spacing))
+    
+    plt.yticks(vertical_ticks)
 
     # Smart x-axis tick spacing
     total_iters = len(energies_relative_kcal)
