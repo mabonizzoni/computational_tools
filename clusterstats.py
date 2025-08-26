@@ -132,15 +132,15 @@ def calculate_utilization_display(assigned, available, resource_name):
     if available > 0:
         util_percent = (assigned / available) * 100
         color = get_color_for_utilization(util_percent)
-        if resource_name == "cores":
-            return f"{color}{assigned:,} used / {available:,} total {resource_name} ({util_percent:.1f}%){Colors.RESET}"
-        else:  # memory
+        if resource_name == "memory":
             return f"{color}{format_memory(assigned)} used / {format_memory(available)} total ({util_percent:.1f}%){Colors.RESET}"
+        else:  # cores or devices - format as integers
+            return f"{color}{assigned:,} used / {available:,} total {resource_name} ({util_percent:.1f}%){Colors.RESET}"
     else:
-        if resource_name == "cores":
-            return f"0 used / 0 total {resource_name} (0.0%)"
-        else:  # memory
+        if resource_name == "memory":
             return f"0 used / 0 total (0.0%)"
+        else:  # cores or devices
+            return f"0 used / 0 total {resource_name} (0.0%)"
 
 def format_memory(mb):
     """Format memory in human-readable units"""
@@ -256,21 +256,9 @@ def analyze_cluster():
         # Step 4: Apply inclusion/exclusion logic
         include, reason, node_type = should_include_node(node_name, state, qlist, vntype)
         
-        # Step 5: Handle offline nodes
-        # We track offline counts separately since they affect capacity planning
+        # Step 5: Handle offline vnodes - skip for simplified model
+        # In the unified model, we don't track offline counts separately
         if reason == "down_offline":
-            # Determine what type of node this would be if it were online
-            # This helps with capacity planning and understanding true cluster size
-            if qlist:
-                node_queues = set(str(qlist).split(','))
-                node_queues = {q.strip() for q in node_queues if q.strip()}
-                if 'gpuq' in node_queues:
-                    stats['gpu']['offline_nodes'] += 1
-                else:
-                    stats['compute']['offline_nodes'] += 1
-            else:
-                # Default assumption if no queue info available
-                stats['compute']['offline_nodes'] += 1
             continue
         
         # Step 6: Handle excluded nodes
@@ -292,30 +280,22 @@ def analyze_cluster():
         jobs_str = node.get('jobs', '')
         unique_jobs = count_unique_jobs(jobs_str)
         
-        # Step 8: Add resources to appropriate category
+        # Step 8: Add resources to unified pools
+        # All CPU cores and memory go into the main compute pool
+        # GPU devices are tracked separately but jobs may overlap
+        stats['compute']['cores_available'] += ncpus_available
+        stats['compute']['cores_assigned'] += ncpus_assigned
+        stats['compute']['memory_available_mb'] += mem_available
+        stats['compute']['memory_assigned_mb'] += mem_assigned
+        stats['compute']['unique_jobs'].update(unique_jobs)
+        
+        # If this is a GPU vnode, also track GPU devices
         if node_type == "gpu":
-            # GPU nodes: track both CPU cores AND GPU devices
-            stats['gpu']['included_nodes'] += 1
-            stats['gpu']['cpu_cores_available'] += ncpus_available
-            stats['gpu']['cpu_cores_assigned'] += ncpus_assigned
-            stats['gpu']['memory_available_mb'] += mem_available
-            stats['gpu']['memory_assigned_mb'] += mem_assigned
-            stats['gpu']['unique_jobs'].update(unique_jobs)
-            
-            # GPU-specific resources: actual GPU devices
             ngpus_available = safe_int_parse(node.get('resources_available.ngpus', 0))
             ngpus_assigned = safe_int_parse(node.get('resources_assigned.ngpus', 0))
             stats['gpu']['gpu_devices_available'] += ngpus_available
             stats['gpu']['gpu_devices_assigned'] += ngpus_assigned
-            
-        else:  # compute node
-            # Regular compute nodes: just CPU cores and system memory
-            stats['compute']['included_nodes'] += 1
-            stats['compute']['cores_available'] += ncpus_available
-            stats['compute']['cores_assigned'] += ncpus_assigned
-            stats['compute']['memory_available_mb'] += mem_available
-            stats['compute']['memory_assigned_mb'] += mem_assigned
-            stats['compute']['unique_jobs'].update(unique_jobs)
+            stats['gpu']['unique_jobs'].update(unique_jobs)
     
     return stats
 
@@ -325,55 +305,37 @@ def print_utilization_report(stats):
     print(f"{Colors.BOLD}CLUSTER UTILIZATION{Colors.RESET}")
     print("=" * 19)
     
-    # Section 1: Compute node summary
-    # Show both active and offline counts for capacity planning
-    compute_total_nodes = stats['compute']['included_nodes'] + stats['compute']['offline_nodes']
-    print(f"Compute Nodes: {stats['compute']['included_nodes']} active, {stats['compute']['offline_nodes']} offline ({compute_total_nodes} total)")
-    
-    # Display compute resource utilization with color coding
+    # Section 1: Unified CPU and Memory (all nodes combined)
     print(f"CPU:          {calculate_utilization_display(stats['compute']['cores_assigned'], stats['compute']['cores_available'], 'cores')}")
     print(f"Memory:       {calculate_utilization_display(stats['compute']['memory_assigned_mb'], stats['compute']['memory_available_mb'], 'memory')}")
     
-    # Section 2: GPU node summary (only show if GPU nodes exist)
-    # This section appears only if cluster has GPU resources
-    if stats['gpu']['included_nodes'] > 0 or stats['gpu']['offline_nodes'] > 0:
-        print()  # Blank line separator
-        gpu_total_nodes = stats['gpu']['included_nodes'] + stats['gpu']['offline_nodes']
-        print(f"GPU Nodes:    {stats['gpu']['included_nodes']} active, {stats['gpu']['offline_nodes']} offline ({gpu_total_nodes} total)")
-        
-        # GPU nodes have both CPU cores AND GPU devices to track
-        print(f"CPU:          {calculate_utilization_display(stats['gpu']['cpu_cores_assigned'], stats['gpu']['cpu_cores_available'], 'cores')}")
+    # Section 2: GPU devices (only show if GPUs exist in cluster)  
+    if stats['gpu']['gpu_devices_available'] > 0:
         print(f"GPUs:         {calculate_utilization_display(stats['gpu']['gpu_devices_assigned'], stats['gpu']['gpu_devices_available'], 'devices')}")
-        print(f"GPU Memory:   {calculate_utilization_display(stats['gpu']['memory_assigned_mb'], stats['gpu']['memory_available_mb'], 'memory')}")
     
     # Section 3: Job summary
-    # Show running jobs by category (helps understand workload distribution)
     print()
-    total_compute_jobs = len(stats['compute']['unique_jobs'])
-    total_gpu_jobs = len(stats['gpu']['unique_jobs'])
+    total_jobs = len(stats['compute']['unique_jobs'])
+    gpu_jobs = len(stats['gpu']['unique_jobs'])
     
-    if total_gpu_jobs > 0:
-        print(f"Jobs:         {total_compute_jobs} running (compute), {total_gpu_jobs} running (GPU)")
+    if gpu_jobs > 0:
+        print(f"Jobs:         {total_jobs} running total, {gpu_jobs} using GPUs")
     else:
-        print(f"Jobs:         {total_compute_jobs} running")
+        print(f"Jobs:         {total_jobs} running")
     
-    # Section 4: Exclusions summary
-    # Report what nodes are not counted and why (for transparency)
+    # Section 4: Exclusions summary (unchanged)
     exclusions = []
     
-    # Nodes that only serve non-monitored queues (interactive, class, admin only)
     if stats['excluded_counts']['no_monitored_queues'] > 0:
         excluded_nodes = ', '.join(sorted(stats['excluded_nodes']['no_monitored_queues']))
         plural = "nodes" if stats['excluded_counts']['no_monitored_queues'] > 1 else "node"
         exclusions.append(f"  {stats['excluded_counts']['no_monitored_queues']} {plural} with no monitored queues ({excluded_nodes})")
     
-    # Other exclusions (wrong vnode type, login nodes, etc.)
     if stats['excluded_counts']['not_compute_vnode'] > 0:
         other_nodes = ', '.join(sorted(stats['excluded_nodes']['not_compute_vnode']))
         plural = "nodes" if stats['excluded_counts']['not_compute_vnode'] > 1 else "node"
         exclusions.append(f"  {stats['excluded_counts']['not_compute_vnode']} non-compute {plural} ({other_nodes})")
     
-    # Only show exclusions section if there are actually excluded nodes
     if exclusions:
         print(f"\nExcluded:")
         for exclusion in exclusions:
