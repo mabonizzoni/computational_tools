@@ -83,10 +83,12 @@ def should_include_node(node_name, state, qlist, vntype):
     Returns: (should_include: bool, reason: str, node_type: str)
     """
     # First check: Skip nodes that are offline or down
-    # Mixed states like 'job-busy,offline' should be treated as offline
-    # since they're not available for new job scheduling
-    state_str = str(state).upper()
-    if 'DOWN' in state_str or 'OFFLINE' in state_str:
+    # PBS states can include: free, offline, down, job-busy, job-exclusive, 
+    # job-sharing, busy, time-shared, state-unknown, etc.
+    # Mixed states are comma-separated like 'job-busy,offline'
+    state_str = str(state).lower()
+    if ('down' in state_str or 'offline' in state_str or 
+        'state-unknown' in state_str or 'unknown' in state_str):
         return False, "down_offline", "unknown"
     
     # Second check: Only include actual compute/GPU nodes
@@ -207,6 +209,12 @@ def parse_pbsnodes_output(json_data):
     
     return processed_nodes
 
+def get_physical_node_name(vnode_name):
+    """Extract physical node name from vnode name (remove [X] suffix if present)"""
+    if '[' in vnode_name and ']' in vnode_name:
+        return vnode_name.split('[')[0]
+    return vnode_name
+
 def analyze_cluster():
     """Analyze cluster utilization and return statistics"""
     
@@ -238,8 +246,13 @@ def analyze_cluster():
             'unique_jobs': set()
         },
         'total_nodes': 0,
-        'excluded_counts': defaultdict(int),    # Count by exclusion reason
-        'excluded_nodes': defaultdict(list)     # Actual node names by reason
+        'excluded_counts': defaultdict(int),    # Count by exclusion reason  
+        'excluded_physical_nodes': defaultdict(set),     # Use sets for physical nodes only
+        'excluded_reasons': {              # Map exclusion reasons to descriptions
+            'down_offline': 'offline/down',
+            'no_monitored_queues': 'no monitored queues', 
+            'not_compute_vnode': 'non-compute'
+        }
     }
     
     # Step 3: Process each vnode and categorize it
@@ -256,16 +269,17 @@ def analyze_cluster():
         # Step 4: Apply inclusion/exclusion logic
         include, reason, node_type = should_include_node(node_name, state, qlist, vntype)
         
-        # Step 5: Handle offline vnodes - skip for simplified model
-        # In the unified model, we don't track offline counts separately
+        # Step 5: Handle offline vnodes - now track them for reporting
         if reason == "down_offline":
+            physical_node = get_physical_node_name(node_name)
+            stats['excluded_physical_nodes']['down_offline'].add(physical_node)
             continue
         
         # Step 6: Handle excluded nodes
         # Track these for reporting what's not being counted
         if not include:
-            stats['excluded_counts'][reason] += 1
-            stats['excluded_nodes'][reason].append(node_name)
+            physical_node = get_physical_node_name(node_name)
+            stats['excluded_physical_nodes'][reason].add(physical_node)
             continue
         
         # Step 7: Extract and aggregate resource information for included nodes
@@ -302,9 +316,6 @@ def analyze_cluster():
 def print_utilization_report(stats):
     """Print formatted utilization report"""
     
-    print(f"{Colors.BOLD}CLUSTER UTILIZATION{Colors.RESET}")
-    print("=" * 19)
-    
     # Section 1: Unified CPU and Memory (all nodes combined)
     print(f"CPU:          {calculate_utilization_display(stats['compute']['cores_assigned'], stats['compute']['cores_available'], 'cores')}")
     print(f"Memory:       {calculate_utilization_display(stats['compute']['memory_assigned_mb'], stats['compute']['memory_available_mb'], 'memory')}")
@@ -323,18 +334,16 @@ def print_utilization_report(stats):
     else:
         print(f"Jobs:         {total_jobs} running")
     
-    # Section 4: Exclusions summary (unchanged)
+    # Section 4: Exclusions summary
     exclusions = []
     
-    if stats['excluded_counts']['no_monitored_queues'] > 0:
-        excluded_nodes = ', '.join(sorted(stats['excluded_nodes']['no_monitored_queues']))
-        plural = "nodes" if stats['excluded_counts']['no_monitored_queues'] > 1 else "node"
-        exclusions.append(f"  {stats['excluded_counts']['no_monitored_queues']} {plural} with no monitored queues ({excluded_nodes})")
-    
-    if stats['excluded_counts']['not_compute_vnode'] > 0:
-        other_nodes = ', '.join(sorted(stats['excluded_nodes']['not_compute_vnode']))
-        plural = "nodes" if stats['excluded_counts']['not_compute_vnode'] > 1 else "node"
-        exclusions.append(f"  {stats['excluded_counts']['not_compute_vnode']} non-compute {plural} ({other_nodes})")
+    for reason, physical_nodes in stats['excluded_physical_nodes'].items():
+        if physical_nodes:
+            count = len(physical_nodes)
+            excluded_nodes = ', '.join(sorted(physical_nodes))
+            plural = "nodes" if count > 1 else "node"
+            reason_desc = stats['excluded_reasons'].get(reason, reason)
+            exclusions.append(f"  {count} {plural} ({reason_desc}): {excluded_nodes}")
     
     if exclusions:
         print(f"\nExcluded:")
