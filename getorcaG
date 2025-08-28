@@ -3,12 +3,33 @@
 # Script to extract Gibbs free energy from ORCA output files
 
 if [ $# -eq 1 ]; then
-    # Command line argument provided - use it as filename
-    filename="$1"
+    # Command line argument provided - could be file or directory
+    input="$1"
     
-    # Check if file exists
-    if [ ! -f "$filename" ]; then
-        echo "Error: File '$filename' does not exist." >&2
+    if [ -f "$input" ]; then
+        # It's a file
+        filename="$input"
+    elif [ -d "$input" ]; then
+        # It's a directory - look for *.property.txt files in it
+        property_files=("$input"/*.property.txt)
+        
+        # Check if any .property.txt files exist in the directory
+        if [ ! -e "${property_files[0]}" ]; then
+            echo "Error: No .property.txt files found in directory '$input'." >&2
+            exit 1
+        fi
+        
+        # Check if multiple .property.txt files exist
+        if [ ${#property_files[@]} -gt 1 ]; then
+            echo "Error: Multiple .property.txt files found in '$input'. Please specify which file to use." >&2
+            echo "Found files:"
+            printf '%s\n' "${property_files[@]}"
+            exit 1
+        fi
+        
+        filename="${property_files[0]}"
+    else
+        echo "Error: '$input' is neither a file nor a directory." >&2
         exit 1
     fi
 else
