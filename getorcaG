@@ -1,0 +1,44 @@
+#!/bin/bash
+
+# Script to extract Gibbs free energy from ORCA output files
+
+if [ $# -eq 1 ]; then
+    # Command line argument provided - use it as filename
+    filename="$1"
+    
+    # Check if file exists
+    if [ ! -f "$filename" ]; then
+        echo "Error: File '$filename' does not exist." >&2
+        exit 1
+    fi
+else
+    # No argument provided - look for *.property.txt file
+    property_files=(*.property.txt)
+    
+    # Check if any .property.txt files exist
+    if [ ! -e "${property_files[0]}" ]; then
+        echo "Error: No .property.txt files found in current directory." >&2
+        exit 1
+    fi
+    
+    # Check if multiple .property.txt files exist
+    if [ ${#property_files[@]} -gt 1 ]; then
+        echo "Error: Multiple .property.txt files found. Please specify which file to use." >&2
+        echo "Found files:"
+        printf '%s\n' "${property_files[@]}"
+        exit 1
+    fi
+    
+    filename="${property_files[0]}"
+fi
+
+# Extract the Gibbs free energy value
+result=$(grep "&FREEENERGYG" "$filename" | sed 's/.* //')
+
+# Check if extraction was successful
+if [ -z "$result" ]; then
+    echo "Error: Could not find FREEENERGYG entry in '$filename'." >&2
+    exit 1
+fi
+
+echo "$result"
