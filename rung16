@@ -1,0 +1,444 @@
+#!/bin/bash
+#
+# PBS job submission script for Gaussian 16 based on the rungaussian system script
+# This version autodetects the number of cores and memory request from the input file,
+# queries PBS for queue limits and selects the most appropriate queue, then submits the job.
+# The submitted script (in the heredoc submitted to qsub) is almost verbatim from the system version.
+# Usage: rung16 [-f|--force] input_file [output_file]
+#
+
+# Set input file, output file names, and force flag
+force_mode=false
+input_file=""
+output_file=""
+
+# Parse command line arguments - this can handle any mix of positional arguments and flags
+# $# is the number of command-line arguments
+# in if, -z means "is empty"
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -f|--force)
+            force_mode=true
+            shift
+            ;;
+        -*)
+            echo "Unknown option: $1"
+            echo "Usage: rung16 [-f|--force] input_file [output_file]"
+            exit 1
+            ;;
+        *)
+            if [ -z "$input_file" ]; then
+                input_file="$1"
+            elif [ -z "$output_file" ]; then
+                output_file="$1"
+            else
+                echo "Too many arguments"
+                echo "Usage: rung16 [-f|--force] input_file [output_file]"
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Check if input file was provided (-z means "is empty")
+if [ -z "$input_file" ]; then
+    echo "Usage: rung16 [-f|--force] input_file [output_file]"
+    exit 1
+fi
+
+# Set default output file if not provided
+if [ -z "$output_file" ]; then
+    output_file=$input_file.log
+fi
+
+# Check if input file exists (-f checks if $input_file is a regular existing file, not a directory etc)
+if [ ! -f "$input_file" ]; then
+    echo "ERROR: Input file $input_file not found"
+    exit 1
+fi
+
+# Extract requested core count from input file using Perl-compatible regular expressions (P flag)
+# The \s* handles optional whitespace, and \K discards the matched prefix, leaving only the number.
+file_cpus=$(grep -ioP '%nprocshared\s*=\s*\K[0-9]+' "$input_file")
+if [ -z "$file_cpus" ]; then
+    cpus=1
+    echo "No %NProcShared directive found in input file, defaulting to 1 core"
+else
+    cpus=$file_cpus
+    echo "Requesting $cpus cores as specified in input file"
+fi
+
+# Extract memory request and units
+# tr translates uppercase to lowercase if necessary
+file_mem_and_unit=$(grep -ioP '%mem\s*=\s*\K[0-9]+[a-z]*' "$input_file" | tr '[:upper:]' '[:lower:]')
+
+# If no memory request was found, exit with an error
+if [ -z "$file_mem_and_unit" ]; then
+    echo "ERROR: No '%mem' directive found in the input file." >&2
+    echo "Without a %mem directive, the job would be assigned the default for the small queue (900MB)." >&2
+    echo "Please specify a memory request with %mem=... directive." >&2
+    exit 1
+fi
+
+# Extract memory request and unit using regex
+# the contents of file_mem_and_unit are guaranteed to be lowercase because of tr before
+if [[ $file_mem_and_unit =~ ^([0-9]+)([a-z]*)$ ]]; then
+    mem_value=${BASH_REMATCH[1]}
+    mem_unit=${BASH_REMATCH[2]}
+else
+    # something is wrong with the extraction - exit with error
+    echo "ERROR: Invalid memory format: '$file_mem_and_unit'" >&2
+    echo "Expected format: number followed by optional unit (e.g., '32gb', '4000mb')" >&2
+    exit 1
+fi
+
+# Convert all memory values to a common unit: megabytes
+# This handles gb, mb, and the default word-based Gaussian units.
+if [ "$mem_unit" == "gb" ]; then
+    total_mem_mb=$((mem_value * 1024))
+elif [ "$mem_unit" == "mb" ]; then
+    total_mem_mb=$mem_value
+else
+    # The unit is not specified, so Gaussian interprets it as a number of 8-byte words.
+    # This may be a mistake in the input file, so we warn them.
+    echo "WARNING: No memory unit specified in '%mem=$mem_value'." >&2
+    echo "         Gaussian interprets this as 8-byte words, which may not be what you intended." >&2
+    # 1 MB = 131,072 words; conversion is done with integer arithmetic and rounding up
+    total_mem_mb=$(( (mem_value + 131071) / 131072 ))
+fi
+
+# Add 4GB overhead for the Gaussian program itself, converted to MB
+total_mem_mb=$((total_mem_mb + 4 * 1024))
+
+# Convert back to GB at the end, rounding up
+default_mem_gb=$(( (total_mem_mb + 1023) / 1024 ))
+
+# Report the found memory request to the user and ask for confirmation
+if [ "$force_mode" = true ]; then
+    mem_gb=$default_mem_gb
+else
+    echo -n "Use ${default_mem_gb}GB memory? (Enter = yes, or type requested memory, in GB, as number only): "
+    read -r user_mem
+    mem_gb=${user_mem:-$default_mem_gb}
+fi
+
+# Cache the entire qstat JSON output in a single variable
+queue_json=$(qstat -Q -f -F json)
+
+# Get a dynamic list of all available queues for validation
+# Note the < <: this is Bash process substitution: treats the output of a command as if it were a temporary file.
+# The -r flag in jq stands for "raw output" to avoid jq enclosing an output string in double quotes
+readarray -t all_queues < <(jq -r '.Queue | keys[]' <<< "$queue_json")
+
+# Get available queues using JSON output and jq
+# Find the best queue that fits our job requirements from a hard-coded list of production queues
+# The "production queues" are "small", "medium", "large", "express", and "bigmem".
+selected_queue_info=$(echo "$queue_json" | jq -r --arg cpus "$cpus" --arg mem "$mem_gb" --argjson prod_queues '["small","medium","large","express","bigmem"]' '
+  .Queue | to_entries | 
+  map(select(.key | IN($prod_queues[]))) |
+  map({
+    name: .key,
+    max_cpus: (.value.resources_max.ncpus // 9999 | tonumber),
+    max_mem_gb: ((.value.resources_max.mem // "9999gb") | gsub("gb|mb"; "") | tonumber),
+    walltime: (.value.resources_max.walltime // "999:00:00")
+  }) |
+  sort_by([.max_cpus, .max_mem_gb]) |
+  map(select(.max_cpus >= ($cpus | tonumber) and .max_mem_gb >= ($mem | tonumber))) |
+  first |
+  if . == null then null else "\(.name):\(.walltime)" end
+')
+
+# Check if queue selection failed
+if [[ "$selected_queue_info" == "null" ]]; then
+    echo "ERROR: No suitable production queue found."
+    exit 1
+fi
+
+# Parse the result with herestring approach
+IFS=':' read -r recommended_queue recommended_walltime <<< "$selected_queue_info"
+
+# Ask user to confirm the auto-selected queue, with validation loop
+if [ "$force_mode" = true ]; then
+    selected_queue=$recommended_queue
+    selected_walltime=$recommended_walltime
+else
+    while true; do
+        echo -n "Submit to $recommended_queue? (Enter = yes, or type queue name): "
+        read -r user_queue
+        selected_queue=${user_queue:-$recommended_queue}
+        
+        # Check if the selected queue exists in the system
+        if [[ ! " ${all_queues[@]} " =~ " $selected_queue " ]]; then
+            echo "ERROR: '$selected_queue' is not a valid queue on this system."
+            echo "Valid options: ${all_queues[*]}"
+            echo "Please try again."
+            continue
+        fi
+        
+        # Get limits for the selected queue
+        selected_queue_limits=$(jq -r --arg queue "$selected_queue" '
+            .Queue[$queue] | {
+                max_cpus: (.resources_max.ncpus // 9999 | tonumber),
+                max_mem_gb: ((.resources_max.mem // "9999gb") | gsub("gb|mb"; "") | tonumber),
+                walltime: (.resources_max.walltime // "999:00:00")
+            } | "\(.max_cpus):\(.max_mem_gb):\(.walltime)"
+        ' <<< "$queue_json")
+        
+        IFS=':' read -r max_cpus max_mem_gb selected_walltime <<< "$selected_queue_limits"
+        
+        # Validate the selected queue can handle the job
+        if [ "$cpus" -gt "$max_cpus" ] || [ "$mem_gb" -gt "$max_mem_gb" ]; then
+            echo "ERROR: Queue '$selected_queue' cannot handle this job:"
+            echo "  Job needs: ${cpus} CPUs, ${mem_gb}GB memory"
+            echo "  Queue limits: ${max_cpus} CPUs, ${max_mem_gb}GB memory"
+            echo "Please choose a different queue."
+            echo
+            continue
+        fi
+        
+        # If we get here, the queue is valid and suitable
+        break
+    done
+fi
+
+# Propose walltime limit to user and ask for confirmation or change
+if [ "$force_mode" = true ]; then
+    walltime=$selected_walltime
+else
+    echo -n "Use walltime $selected_walltime? (Enter = yes, or type HH:MM:SS): "
+    read -r user_walltime
+    walltime=${user_walltime:-$selected_walltime}
+fi
+
+# Ensure walltime is in proper HH:MM:SS format
+# The outer if condition is true only if the $walltime variable is NOT in the HH:MM:SS format
+# If the user enters a valid format (e.g., 48:00:00), this entire if block is skipped
+if [[ ! $walltime =~ ^[0-9]+:[0-9]{2}:[0-9]{2}$ ]]; then
+    # the walltime is not in the HH:MM:SS format. Let's check is it is just a number:
+    if [[ $walltime =~ ^[0-9]+$ ]]; then
+        # It is, in fact, just a number: let's assume it represents an hours value and convert it to HH:MM:SS
+        walltime="${walltime}:00:00"
+    else
+        # It's in some other format, I don't know what to do and throw a warning
+        echo "WARNING: Walltime format may be incorrect. Expected HH:MM:SS format." >&2
+    fi
+fi
+echo
+echo "=== Job Submission Summary ==="
+echo "Queue: $selected_queue"
+echo "CPUs: $cpus"
+echo "Memory: ${mem_gb}GB"  
+echo "Walltime: $walltime"
+echo "Input: $input_file"
+echo "Output: $output_file"
+echo
+
+#======================================
+# The following portion mimics almost =
+# completely the same portion of the  =
+# original rungaussian                =
+# =====================================
+
+# Get current directory
+current_dir=$(pwd)
+
+# Generate job name
+job_name=$(basename $input_file .com)"_g16"
+
+# Get user email to send job status notifications
+my_email=$(head -1 ~/.forward 2>/dev/null || true)
+
+echo "Submitting job..."
+
+
+
+# --- TEMPORARY DRY RUN MODE ---
+echo "DRY RUN: The following command would be executed:"
+echo "qsub -q \"$selected_queue\" -l walltime=\"$walltime\" -l select=ncpus=$cpus:mpiprocs=$cpus:mem=${mem_gb}gb -r n -j oe -N \"$job_name\" -M \"$my_email\""
+exit 0
+# --- END TEMPORARY DRY RUN MODE ---
+# the following code is not reached because the exit 0 will stop the script
+
+
+
+# Submit PBS job
+if qsub -q $selected_queue -r n -l walltime=$walltime -l select=ncpus=$cpus:mpiprocs=$cpus:mem=${mem_gb}gb -j oe -N $job_name -M $my_email <<END_QSUB
+#!/bin/bash
+# 
+# The following job script code is adapted from the original rungaussian script
+# developed by Dave Young, HPC Computational Specialist at the Alabama Supercomputer Center.
+# Original script is the intellectual property of CSRA (formerly CSC).
+# The Alabama Supercomputer Authority has rights to continue using this software.
+#
+# The output of this script is written to the .o<jobnumber> output capture file.
+
+# set the workdir variable
+if [[ $(hostname) =~ ^asax || $(hostname) =~ ^m1 ]]; then
+    export workdir="/scratch-local/${LOGNAME}.${PBS_JOBNAME}.${PBS_JOBID}"
+fi
+
+echo "============================================================"
+echo "=====         Summary of your Gaussian job             ====="
+echo "============================================================"
+echo "  The input file is: $input_file"
+echo "  The output file is: $output_file"
+echo "  The time limit is $walltime."
+echo "  The target directory is: $current_dir"
+echo "  The working directory is:" \$workdir
+echo "  The memory limit is: ${mem_gb}GB" # note the curly braces to clarify that the variable being expanded is mem_gb and still have no space after it
+echo "  The number of CPUs is: $cpus"
+echo "  Job Name: $job_name"
+echo "  Queue: $selected_queue"
+export FIRST_NODE=\`cat \$PBS_NODEFILE | head -1\`
+export NUM_MASTER_NODE=\`cat \$PBS_NODEFILE | grep \$FIRST_NODE | wc -w\`
+echo "  Using " \$NUM_MASTER_NODE " cores on master node " \$FIRST_NODE
+echo
+#
+# =====================
+# Execute the program =
+# =====================
+
+if [ -d \$workdir ] 
+then
+  echo "Directory \$workdir already exists"
+else
+  echo "Making directory \$workdir"
+  mkdir \$workdir
+fi
+
+cd \$workdir
+
+# load modules
+source /apps/profiles/modules_asax.sh.dyn
+module purge
+
+# prevent core dumps
+ulimit -c 0
+
+# Set Gaussian configuration
+if [[ $(hostname) =~ ^asax || $(hostname) =~ ^m1 ]]; then
+  # we have reports of some jobs failing with avx512 so that is never attempted in this version
+  if grep -qi ' avx2' /proc/cpuinfo
+  then
+    echo "Running the AVX2 version."
+    module purge
+    module load gaussian/g16c01_avx2
+  else
+    echo "Running the AVX version."
+    module purge
+    module load gaussian/g16c01_avx
+  fi
+fi
+
+export GAUSS_SCRDIR=\$workdir
+export TMPDIR=\$workdir
+echo "g16root = "\$g16root
+
+if [ -d $current_dir ] 
+then
+
+  if [ -f $current_dir/$input_file ] 
+  then
+    cp $current_dir/$input_file \$workdir
+  else
+    echo "Can't find file $current_dir/$input_file"
+  fi
+
+  if [ -f $current_dir/$input_file.chk ] 
+  then
+    cp $current_dir/$input_file.chk \$workdir
+  fi
+
+else
+  echo "Can't find directory $current_dir for input file."
+fi
+
+# run Gaussian
+echo "Starting time: $(date)"
+\$g16root/g16/g16 < $input_file > $current_dir/$output_file 
+echo "End time: $(date)"
+
+# Ask for a file buffer flush to disk and wait to make sure it is completed
+sync
+sleep 60
+
+# Return files to the user's job starting directory and cleanup files on the compute node
+echo
+echo "Copying and removing files:"
+rm -f *.rwf
+
+if [ -d $current_dir ]
+then
+  # The directory from which the job was stated still exists:
+  # Proceed with copying output back into it
+  if [ -f fort.7 ]
+  then
+    mv fort.7 $input_file.punch
+  fi
+
+  # rungaussian originally used a cp_wild script to get around 
+  # SLURM limitations on wildcards in submission scripts
+  #/scripts/cp_wild \$workdir $current_dir
+  # This should no longer be the case, so instead a standard cp expression is used.
+  # we do check whether there are any files in the working directory before trying to copy
+  # otherwise copy may fail and the whole script may fail cryptically from it
+  # the check is silent (both stdout and stderr are redirected to /dev/null
+  if ls "\$workdir"/* 1> /dev/null 2>&1; then
+    cp "\$workdir"/* "$current_dir"
+  else
+    echo "No output files to copy from \$workdir"
+  fi
+
+  cd $current_dir
+  rm -f \$workdir/.NOPBSERASE
+  echo "Removing \$workdir 1"
+  rm -r \$workdir
+
+else
+  # Something went wrong: the $current_dir, i.e. the location into which 
+  # output files should be copied, no longer exists
+  # Perhaps the user deleted it while the job was running
+  # Let's prevent deletion of the output files by the PBS epilogue script:
+  # create an empty flag file (.NOPBSERASE) that indicates to the epilogue script 
+  # that the working directory on the compute node should be retained
+  touch \$workdir/.NOPBSERASE
+  echo "Unable to find directory $current_dir to copy files to"
+  echo "Job output files were retained on the compute node"
+  echo "Promptly remove files from \$workdir"
+fi
+
+# Ask for a file buffer flush to disk and wait to make sure it is completed
+sync
+sleep 30
+
+if [ -f /metrics/jobs/\${PBS_JOBID}.txt ]
+then
+  rm /metrics/jobs/\${PBS_JOBID}.txt
+fi
+
+sleep 5
+
+job_num=\$( /usr/bin/echo \${PBS_JOBID} | /usr/bin/cut -f 1 -d '.' )
+#echo "job_num=\${job_num}"
+#echo "PBS_JOBID=\${PBS_JOBID}"
+if [ -f /metrics/jobs/\${job_num}.txt ]
+then
+  #echo "deleting /metrics/jobs/\${job_num}.txt"
+  rm /metrics/jobs/\${job_num}.txt
+fi
+
+exit 0
+END_QSUB
+then
+    echo
+    echo "Job submitted successfully!"
+    echo
+    echo "Current job queue:"
+    qstat
+else
+    echo
+    echo "ERROR: Job submission failed!"
+    echo "Please check the error message above and try again."
+    exit 1
+fi
